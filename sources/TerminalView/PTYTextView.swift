@@ -1296,7 +1296,9 @@ extension PTYTextView {
 // A WKWebView overlaid on a rectangle of cells of the visible screen grid. State lives on the view
 // itself so PTYTextView needs no extra storage.
 @objc(iTermInlineWebView)
-class InlineWebView: WKWebView, WKNavigationDelegate {
+class InlineWebView: WKWebView, WKNavigationDelegate, iTermMetalDisabling {
+    func viewDisablesMetal() -> Bool { true }
+
     static let allowedHostsKey = "InlineWebViewAllowedHosts"
     var webViewID = ""
     var row = 0, col = 0, cols = 0, rows = 0
@@ -1382,6 +1384,7 @@ extension PTYTextView {
             return
         }
         updateInlineWebViewFrames()
+        NotificationCenter.default.post(name: NSNotification.Name.iTermPortholesDidChange, object: nil)
         updateAlphaValue()
         delegate?.textViewDidAddOrRemovePorthole()
     }
@@ -1406,6 +1409,7 @@ extension PTYTextView {
             window?.makeFirstResponder(self)
         }
         doomed.forEach { $0.removeFromSuperview() }
+        NotificationCenter.default.post(name: NSNotification.Name.iTermPortholesDidChange, object: nil)
         updateAlphaValue()
         delegate?.textViewDidAddOrRemovePorthole()
     }
