@@ -4489,6 +4489,10 @@ static NSString *VT100TerminalCompactFloat(CGFloat value) {
         [_delegate terminalSetBadgeFormat:value];
     } else if ([key isEqualToString:@"SetUserVar"]) {
         [_delegate terminalSetUserVar:value];
+    } else if ([key isEqualToString:@"WebView"] ||
+               [key isEqualToString:@"WebViewMove"] ||
+               [key isEqualToString:@"WebViewRemove"]) {
+        [_delegate terminalInlineWebViewCommand:key value:value];
     } else if ([key isEqualToString:@"ReportCellSize"]) {
         if ([_delegate terminalShouldSendReport:YES]) {
             double floatScale;

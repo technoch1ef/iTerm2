@@ -3977,6 +3977,7 @@ webViewConfiguration:(WKWebViewConfiguration *)webViewConfiguration
     // tmuxMode is cleared below, before observers are notified.
     const BOOL wasTmuxClient = (self.tmuxMode == TMUX_CLIENT);
     [self forgetAITitleState];
+    [_textview removeAllInlineWebViews];
     if (self.isBrowserSession) {
         [self terminateBrowser];
     }
@@ -16054,6 +16055,7 @@ typedef NS_ENUM(NSUInteger, PTYSessionTmuxReport) {
     // protocol enabled in sessions without shell integration (which never emit the
     // OSC 133 prompt mark that otherwise resets it).
     [_kittyDnDBridge reset];
+    [_textview removeAllInlineWebViews];
 }
 
 - (void)screenDidReceiveOSC7WhileDisabled {
@@ -17872,6 +17874,10 @@ typedef NS_ENUM(NSUInteger, PTYSessionTmuxReport) {
                                               value:assignment.value
                                                pane:self.tmuxPane];
     }
+}
+
+- (void)screenInlineWebViewCommand:(NSString *)command value:(NSString *)value {
+    [_textview handleInlineWebViewCommand:command value:value];
 }
 
 - (void)setVariableNamed:(NSString *)name toValue:(id)newValue {
@@ -20264,6 +20270,9 @@ static const NSTimeInterval PTYSessionFocusReportBellSquelchTimeIntervalThreshol
     [self.variablesScope setValue:@(showing)
                  forVariableNamed:iTermVariableKeySessionShowingAlternateScreen];
     [self removeSelectedCommandRange];
+    if (!showing) {
+        [_textview removeAllInlineWebViews];
+    }
 }
 
 - (void)screenReportKeyUpDidChange:(BOOL)reportKeyUp {

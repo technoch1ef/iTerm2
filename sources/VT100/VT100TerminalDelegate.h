@@ -516,6 +516,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)terminalSetBackgroundImageFile:(NSString *)filename;
 - (void)terminalSetBadgeFormat:(NSString *)badge;
 - (void)terminalSetUserVar:(NSString *)kvp;
+- (void)terminalInlineWebViewCommand:(NSString *)command value:(NSString *)value;
 - (void)terminalSetProfileProperty:(NSString *)kvp;
 
 - (BOOL)terminalFocusReportingAllowed;

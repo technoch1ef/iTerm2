@@ -7,6 +7,7 @@
 
 import Foundation
 import UniformTypeIdentifiers
+import WebKit
 
 // Posted when lines are shifted by fold/unfold. object is the session GUID (String).
 // userInfo keys: absLineKey (NSNumber Int64), deltaKey (NSNumber Int64, positive=insert, negative=remove).
@@ -296,6 +297,7 @@ extension PTYTextView: ExternalSearchResultsController {
         for porthole in portholes {
             updatePortholeFrame(porthole as! Porthole, force: false)
         }
+        updateInlineWebViewFrames()
         DLog("End updatePortholeFrames")
     }
 
@@ -374,7 +376,8 @@ extension PTYTextView: ExternalSearchResultsController {
 
     @objc
     var hasPortholes: Bool {
-        return portholes.count > 0
+        // Inline web views are subviews too, so they need the same non-Metal/alpha treatment.
+        return portholes.count > 0 || !inlineWebViews.isEmpty
     }
 
     // Because Swift can't cope with forward declarations and I don't want a dependency cycle.
@@ -1287,3 +1290,134 @@ extension PTYTextView {
 
 // MARK: - Extend URL Search Results Across Soft Boundaries
 
+
+// MARK: - Inline Web Views (OSC 1337 WebView / WebViewMove / WebViewRemove)
+
+// A WKWebView overlaid on a rectangle of cells of the visible screen grid. State lives on the view
+// itself so PTYTextView needs no extra storage.
+@objc(iTermInlineWebView)
+class InlineWebView: WKWebView, WKNavigationDelegate {
+    static let allowedHostsKey = "InlineWebViewAllowedHosts"
+    var webViewID = ""
+    var row = 0, col = 0, cols = 0, rows = 0
+
+    static func isAllowed(_ url: URL?) -> Bool {
+        guard let url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let host = url.host?.lowercased() else {
+            return false
+        }
+        let hosts = iTermUserDefaults.userDefaults().stringArray(forKey: allowedHostsKey) ?? ["localhost", "127.0.0.1", "example.com"]
+        return hosts.map { $0.lowercased() }.contains(host)
+    }
+
+    // Top-level navigations (including redirects and link clicks) must stay on the allowlist.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let isSubframe = navigationAction.targetFrame.map { !$0.isMainFrame } ?? false
+        decisionHandler(isSubframe || Self.isAllowed(navigationAction.request.url) ? .allow : .cancel)
+    }
+
+    // Esc (with or without Cmd) hands keyboard focus back to the terminal.
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            window?.makeFirstResponder(superview)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.keyCode == 53 && window?.firstResponder === self {
+            window?.makeFirstResponder(superview)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
+extension PTYTextView {
+    fileprivate var inlineWebViews: [InlineWebView] {
+        return subviews.compactMap { $0 as? InlineWebView }
+    }
+
+    @objc(handleInlineWebViewCommand:value:)
+    func handleInlineWebViewCommand(_ command: String, value: String) {
+        var args = [String: String]()
+        for part in value.components(separatedBy: ";") {
+            let kv = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if kv.count == 2 {
+                args[kv[0]] = kv[1]
+            }
+        }
+        guard let id = args["id"], !id.isEmpty else {
+            return
+        }
+        switch command {
+        case "WebView":
+            guard let b64 = args["url"],
+                  let data = Data(base64Encoded: b64.padding(toLength: (b64.count + 3) / 4 * 4, withPad: "=", startingAt: 0)),
+                  let url = URL(string: String(decoding: data, as: UTF8.self)),
+                  InlineWebView.isAllowed(url) else {
+                DLog("Dropping inline web view \(id)")
+                return
+            }
+            removeInlineWebViews(id: id)
+            let view = InlineWebView(frame: .zero, configuration: WKWebViewConfiguration())
+            view.webViewID = id
+            view.navigationDelegate = view
+            place(view, args)
+            addSubview(view)
+            view.load(URLRequest(url: url))
+        case "WebViewMove":
+            guard let view = inlineWebViews.first(where: { $0.webViewID == id }) else {
+                return
+            }
+            place(view, args)
+        case "WebViewRemove":
+            removeInlineWebViews(id: id)
+        default:
+            return
+        }
+        updateInlineWebViewFrames()
+        delegate?.textViewDidAddOrRemovePorthole()
+    }
+
+    private func place(_ view: InlineWebView, _ args: [String: String]) {
+        view.row = args["row"].flatMap { Int($0) } ?? view.row
+        view.col = args["col"].flatMap { Int($0) } ?? view.col
+        view.cols = args["w"].flatMap { Int($0) } ?? view.cols
+        view.rows = args["h"].flatMap { Int($0) } ?? view.rows
+    }
+
+    @objc func removeAllInlineWebViews() {
+        removeInlineWebViews(id: "*")
+    }
+
+    private func removeInlineWebViews(id: String) {
+        let doomed = inlineWebViews.filter { id == "*" || $0.webViewID == id }
+        guard !doomed.isEmpty else {
+            return
+        }
+        if let responder = window?.firstResponder as? NSView, doomed.contains(where: { responder.isDescendant(of: $0) }) {
+            window?.makeFirstResponder(self)
+        }
+        doomed.forEach { $0.removeFromSuperview() }
+        delegate?.textViewDidAddOrRemovePorthole()
+    }
+
+    // Cells are relative to the visible screen grid, which starts below the scrollback.
+    @objc func updateInlineWebViewFrames() {
+        guard let dataSource else {
+            return
+        }
+        let top = CGFloat(dataSource.numberOfScrollbackLines()) * lineHeight + CGFloat(iTermPreferences.topBottomMargins())
+        let left = CGFloat(iTermPreferences.sideMargins())
+        let width = Int(dataSource.width()), height = Int(dataSource.height())
+        for view in inlineWebViews {
+            view.isHidden = view.cols <= 0 || view.rows <= 0 || view.row < 0 || view.col < 0 || view.row >= height || view.col >= width
+            view.frame = NSRect(x: left + CGFloat(view.col) * charWidth,
+                                y: top + CGFloat(view.row) * lineHeight,
+                                width: CGFloat(max(0, min(view.cols, width - view.col))) * charWidth,
+                                height: CGFloat(max(0, min(view.rows, height - view.row))) * lineHeight)
+        }
+    }
+}

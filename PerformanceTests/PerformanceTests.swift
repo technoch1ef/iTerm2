@@ -167,6 +167,7 @@ class FakeSession: NSObject, VT100ScreenDelegate {
     func screenSetBackgroundImageFile(_ filename: String) {}
     func screenSetBadgeFormat(_ theFormat: String) {}
     func screenSetUserVar(_ kvp: String) {}
+    func screenInlineWebViewCommand(_ command: String, value: String) {}
     func screenShouldReduceFlicker() -> Bool { false }
     func screenUnicodeVersion() -> Int { 9 }
     func screenSetUnicodeVersion(_ unicodeVersion: Int) {}

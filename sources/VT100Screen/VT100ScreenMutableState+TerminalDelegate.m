@@ -2190,6 +2190,13 @@ typedef struct {
     } name:@"set user var"];
 }
 
+- (void)terminalInlineWebViewCommand:(NSString *)command value:(NSString *)value {
+    DLog(@"begin %@ %@", command, value);
+    [self addSideEffect:^(id<VT100ScreenDelegate> delegate) {
+        [delegate screenInlineWebViewCommand:command value:value];
+    } name:@"inline web view"];
+}
+
 - (void)terminalResetColor:(VT100TerminalColorIndex)n {
     DLog(@"begin %@", @(n));
     const int key = [self colorMapKeyForTerminalColorIndex:n];

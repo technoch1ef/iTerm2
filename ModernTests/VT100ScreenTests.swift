@@ -2293,6 +2293,9 @@ class FakeSession: NSObject, VT100ScreenDelegate {
     func screenSetUserVar(_ kvp: String) {
 
     }
+
+    func screenInlineWebViewCommand(_ command: String, value: String) {
+    }
     
     func screenShouldReduceFlicker() -> Bool {
         false
