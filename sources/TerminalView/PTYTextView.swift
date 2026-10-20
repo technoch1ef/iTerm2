@@ -1293,15 +1293,62 @@ extension PTYTextView {
 
 // MARK: - Inline Web Views (OSC 1337 WebView / WebViewMove / WebViewRemove)
 
-// A WKWebView overlaid on a rectangle of cells of the visible screen grid. State lives on the view
-// itself so PTYTextView needs no extra storage.
+// A clipping container overlaid on a rectangle of cells of the visible screen grid. It holds a WKWebView laid out at
+// the block's full height and offset by the rows cropped off the top, so a partly scrolled-out block is cropped like
+// text instead of re-laid out. State lives on the view itself so PTYTextView needs no extra storage.
 @objc(iTermInlineWebView)
-class InlineWebView: WKWebView, WKNavigationDelegate, iTermMetalDisabling {
+class InlineWebView: NSView, WKNavigationDelegate, iTermMetalDisabling {
     func viewDisablesMetal() -> Bool { true }
 
     static let allowedHostsKey = "InlineWebViewAllowedHosts"
     var webViewID = ""
-    var row = 0, col = 0, cols = 0, rows = 0
+    var row = 0, col = 0, cols = 0, rows = 0, cropTop = 0, fullRows = 0
+    let web: InlineWKWebView
+
+    init(url: URL) {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        web = InlineWKWebView(frame: .zero, configuration: config)
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        web.navigationDelegate = self
+        addSubview(web)
+        web.load(URLRequest(url: url))
+    }
+
+    required init?(coder: NSCoder) {
+        it_fatalError()
+    }
+
+    override var isFlipped: Bool { true }
+
+    var textView: PTYTextView? { superview as? PTYTextView }
+
+    var isActive: Bool {
+        guard let responder = window?.firstResponder as? NSView else {
+            return false
+        }
+        return responder.isDescendant(of: web)
+    }
+
+    // Until the page is clicked, the block behaves like text: scrolls go to the terminal (so OpenCode's history
+    // scrolls under it) and the first click only activates the page.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let hit = super.hitTest(point)
+        guard hit != nil else {
+            return nil
+        }
+        return isActive ? hit : self
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        textView?.scrollWheel(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(web)
+    }
 
     static func isAllowed(_ url: URL?) -> Bool {
         guard let url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
@@ -1317,19 +1364,25 @@ class InlineWebView: WKWebView, WKNavigationDelegate, iTermMetalDisabling {
         let isSubframe = navigationAction.targetFrame.map { !$0.isMainFrame } ?? false
         decisionHandler(isSubframe || Self.isAllowed(navigationAction.request.url) ? .allow : .cancel)
     }
+}
+
+class InlineWKWebView: WKWebView {
+    private func deactivate() {
+        window?.makeFirstResponder((superview as? InlineWebView)?.textView)
+    }
 
     // Esc (with or without Cmd) hands keyboard focus back to the terminal.
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
-            window?.makeFirstResponder(superview)
+            deactivate()
             return
         }
         super.keyDown(with: event)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.keyCode == 53 && window?.firstResponder === self {
-            window?.makeFirstResponder(superview)
+        if event.keyCode == 53 && (window?.firstResponder as? NSView)?.isDescendant(of: self) == true {
+            deactivate()
             return true
         }
         return super.performKeyEquivalent(with: event)
@@ -1363,16 +1416,10 @@ extension PTYTextView {
                 return
             }
             removeInlineWebViews(id: id)
-            let view = InlineWebView(frame: .zero, configuration: {
-                let config = WKWebViewConfiguration()
-                config.websiteDataStore = .nonPersistent()
-                return config
-            }())
+            let view = InlineWebView(url: url)
             view.webViewID = id
-            view.navigationDelegate = view
             place(view, args)
             addSubview(view)
-            view.load(URLRequest(url: url))
         case "WebViewMove":
             guard let view = inlineWebViews.first(where: { $0.webViewID == id }) else {
                 return
@@ -1394,6 +1441,9 @@ extension PTYTextView {
         view.col = args["col"].flatMap { Int($0) } ?? view.col
         view.cols = args["w"].flatMap { Int($0) } ?? view.cols
         view.rows = args["h"].flatMap { Int($0) } ?? view.rows
+        // Clamped so the CGFloat math below stays sane for any input.
+        view.cropTop = min(max(args["oy"].flatMap { Int($0) } ?? 0, 0), 10_000)
+        view.fullRows = min(max(args["fh"].flatMap { Int($0) } ?? 0, 0), 10_000)
     }
 
     @objc func removeAllInlineWebViews() {
@@ -1432,6 +1482,10 @@ extension PTYTextView {
                                 y: top + CGFloat(view.row) * lineHeight,
                                 width: CGFloat(max(0, min(view.cols, width - view.col))) * charWidth,
                                 height: CGFloat(max(0, min(view.rows, height - view.row))) * lineHeight)
+            view.web.frame = NSRect(x: 0,
+                                    y: -CGFloat(view.cropTop) * lineHeight,
+                                    width: view.frame.width,
+                                    height: CGFloat(max(view.fullRows, view.cropTop + view.rows)) * lineHeight)
         }
     }
 }
