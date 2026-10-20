@@ -1361,7 +1361,11 @@ extension PTYTextView {
                 return
             }
             removeInlineWebViews(id: id)
-            let view = InlineWebView(frame: .zero, configuration: WKWebViewConfiguration())
+            let view = InlineWebView(frame: .zero, configuration: {
+                let config = WKWebViewConfiguration()
+                config.websiteDataStore = .nonPersistent()
+                return config
+            }())
             view.webViewID = id
             view.navigationDelegate = view
             place(view, args)
@@ -1378,6 +1382,7 @@ extension PTYTextView {
             return
         }
         updateInlineWebViewFrames()
+        updateAlphaValue()
         delegate?.textViewDidAddOrRemovePorthole()
     }
 
@@ -1401,6 +1406,7 @@ extension PTYTextView {
             window?.makeFirstResponder(self)
         }
         doomed.forEach { $0.removeFromSuperview() }
+        updateAlphaValue()
         delegate?.textViewDidAddOrRemovePorthole()
     }
 
@@ -1414,6 +1420,10 @@ extension PTYTextView {
         let width = Int(dataSource.width()), height = Int(dataSource.height())
         for view in inlineWebViews {
             view.isHidden = view.cols <= 0 || view.rows <= 0 || view.row < 0 || view.col < 0 || view.row >= height || view.col >= width
+            // Skipping hidden views keeps the subtractions below in range for any parsed Int.
+            if view.isHidden {
+                continue
+            }
             view.frame = NSRect(x: left + CGFloat(view.col) * charWidth,
                                 y: top + CGFloat(view.row) * lineHeight,
                                 width: CGFloat(max(0, min(view.cols, width - view.col))) * charWidth,
