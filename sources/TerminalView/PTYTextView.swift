@@ -1787,7 +1787,8 @@ class InlineWebView: NSView, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
             if let named = Self.namedKeys[key] {
                 strokes.append((named.code, named.chars, named.function ? flags.union([.function, .numericPad]) : flags))
             } else if key.count == 1 {
-                strokes.append((0, key, flags))
+                // shortcut: shift only uppercases letters, use a keyboard layout map if symbols are needed.
+                strokes.append((0, flags.contains(.shift) ? key.uppercased() : key, flags))
             } else {
                 throw InlineWebError("Unknown key \(key).")
             }
@@ -2075,6 +2076,13 @@ class InlineWebControl: NSObject {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         chmod(dir, 0o700)
         let path = dir + "/inlineweb-\(getpid()).sock"
+        // Sockets of processes that died without quitting (e.g. SIGTERM).
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] {
+            if name.hasPrefix("inlineweb-"), name.hasSuffix(".sock"),
+               let pid = pid_t(name.dropFirst(10).dropLast(5)), kill(pid, 0) != 0, errno == ESRCH {
+                unlink(dir + "/" + name)
+            }
+        }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let bytes = Array(path.utf8)
@@ -2189,13 +2197,17 @@ class InlineWebControl: NSObject {
 
     private func perform(_ op: String, _ args: [String: Any], _ textView: PTYTextView, _ reply: @escaping (Result<Any, Error>) -> Void) throws {
         if op == "list" {
-            reply(.success(textView.inlineWebViews.map { $0.info }))
+            reply(.success(textView.inlineWebViews.filter { !$0.web.isHidden }.map { $0.info }))
             return
         }
         guard let id = args["view"] as? String, !id.isEmpty else {
             throw InlineWebError("Missing view.")
         }
         let existing = textView.inlineWebViews.first { $0.webViewID == id }
+        // Placeholders (showBlocked hides the web view) are not addressable.
+        if existing?.web.isHidden == true {
+            throw InlineWebError("Blocked by the inline web allowlist.")
+        }
         func url() throws -> URL {
             guard let url = InlineWebView.desktopURL(args["url"] as? String ?? "") else {
                 throw InlineWebError("Invalid URL.")
