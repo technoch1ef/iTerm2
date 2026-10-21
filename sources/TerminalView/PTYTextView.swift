@@ -1512,7 +1512,8 @@ class InlineWebView: NSView, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
                                    "title": web.title ?? "",
                                    "loading": web.isLoading,
                                    "canGoBack": web.canGoBack,
-                                   "canGoForward": web.canGoForward]
+                                   "canGoForward": web.canGoForward,
+                                   "visible": isVisible]
         if let loadError {
             info["loadError"] = loadError
         }
@@ -1690,10 +1691,18 @@ class InlineWebView: NSView, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
         return web.convert(NSPoint(x: x, y: web.isFlipped ? y : web.bounds.height - y), to: nil)
     }
 
+    // Placed and on screen; elsewhere WebKit ignores synthesized input and pauses requestAnimationFrame.
+    var isVisible: Bool {
+        guard !isHidden, !web.isHidden, let window, !frame.isEmpty else {
+            return false
+        }
+        return window.occlusionState.contains(.visible) && !NSApp.isHidden
+    }
+
     // Synthetic events must never move keyboard focus away from the terminal.
     private func inWindow(_ body: (NSWindow) throws -> Void) throws {
-        guard let window = web.window else {
-            throw InlineWebError("The web view is not in a window.")
+        guard isVisible, let window = web.window else {
+            throw InlineWebError("View is not visible.")
         }
         let before = window.firstResponder
         defer {
@@ -2292,6 +2301,18 @@ class InlineWebControl: NSObject {
         case "eval":
             guard let script = args["script"] as? String else {
                 throw InlineWebError("Missing script.")
+            }
+            let timeout = min(max(args["timeoutMs"] as? Int ?? 10_000, 1), 60_000)
+            // Main thread only, so the first of result and timeout wins and the other is ignored.
+            var answered = false
+            let reply = { (result: Result<Any, Error>) in
+                if !answered {
+                    answered = true
+                    reply(result)
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeout)) {
+                reply(.failure(InlineWebError("Evaluation timed out.")))
             }
             view.web.callAsyncJavaScript(script, arguments: args["args"] as? [String: Any] ?? [:], in: nil, in: .page) { result in
                 reply(result.flatMap { value in
