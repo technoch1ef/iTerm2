@@ -1454,13 +1454,19 @@ class InlineWebView: NSView, WKNavigationDelegate, WKUIDelegate, WKScriptMessage
         guard url.isFileURL, (url.host ?? "").isEmpty else {
             return nil
         }
-        let path = url.standardized.path
-        return roots.first { root in
-            var prefix = root
-            while prefix.hasSuffix("/") {
-                prefix.removeLast()
+        // url.path decodes %2e%2e, so standardizing resolves it; realpath of the longest existing ancestor resolves
+        // symlinks (resolvingSymlinksInPath treats missing files and /private inconsistently).
+        func canonical(_ path: String) -> [String] {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            if let real = realpath(url.path, nil) {
+                defer { free(real) }
+                return URL(fileURLWithPath: String(cString: real)).pathComponents
             }
-            return path == prefix || path.hasPrefix(prefix + "/")
+            return url.path == "/" ? ["/"] : canonical(url.deletingLastPathComponent().path) + [url.lastPathComponent]
+        }
+        let path = canonical(url.path)
+        return roots.first { root in
+            !root.isEmpty && path.starts(with: canonical(root))
         }
     }
 
@@ -1985,6 +1991,10 @@ class InlineWebControl: NSObject {
         weak var session: PTYSession?
         var bound = false
         private let writeQueue = DispatchQueue(label: "com.iterm2.inline-web-control.write")
+        // writeQueue only: no writes once set, so a reused fd number is never written to.
+        private var closed = false
+        private let lock = NSLock()
+        private var pending = 0
 
         init(fd: Int32) {
             self.fd = fd
@@ -2013,7 +2023,8 @@ class InlineWebControl: NSObject {
             DispatchQueue.main.async {
                 InlineWebControl.shared.connections.removeAll { $0 === self }
             }
-            writeQueue.async { [fd] in
+            writeQueue.async { [self] in
+                closed = true
                 Darwin.close(fd)
             }
         }
@@ -2023,7 +2034,24 @@ class InlineWebControl: NSObject {
                 return
             }
             data.append(10)
-            writeQueue.async { [fd] in
+            lock.lock()
+            let overflow = pending + data.count > 8 << 20
+            if !overflow {
+                pending += data.count
+            }
+            lock.unlock()
+            // A client that stops reading is dropped instead of queueing without bound.
+            guard !overflow else {
+                close()
+                return
+            }
+            writeQueue.async { [self] in
+                lock.lock()
+                pending -= data.count
+                lock.unlock()
+                guard !closed else {
+                    return
+                }
                 data.withUnsafeBytes { buf in
                     var offset = 0
                     while offset < buf.count {
@@ -2032,6 +2060,9 @@ class InlineWebControl: NSObject {
                             continue
                         }
                         if n <= 0 {
+                            // Error or SO_SNDTIMEO: stop writing; the reader wakes up and closes the fd.
+                            closed = true
+                            shutdown(fd, SHUT_RDWR)
                             return
                         }
                         offset += n
@@ -2041,8 +2072,10 @@ class InlineWebControl: NSObject {
         }
 
         func close() {
-            writeQueue.async { [fd] in
-                shutdown(fd, SHUT_RDWR)
+            writeQueue.async { [self] in
+                if !closed {
+                    shutdown(fd, SHUT_RDWR)
+                }
             }
         }
     }
@@ -2127,6 +2160,8 @@ class InlineWebControl: NSObject {
                 }
                 var on: Int32 = 1
                 setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+                var timeout = timeval(tv_sec: 5, tv_usec: 0)
+                setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
                 let connection = Connection(fd: client)
                 Thread.detachNewThread {
                     connection.readLoop()
