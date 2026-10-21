@@ -1293,28 +1293,70 @@ extension PTYTextView {
 
 // MARK: - Inline Web Views (OSC 1337 WebView / WebViewMove / WebViewRemove)
 
+struct InlineWebError: LocalizedError {
+    let errorDescription: String?
+    init(_ message: String) {
+        errorDescription = message
+    }
+}
+
+private class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ target: WKScriptMessageHandler) {
+        self.target = target
+    }
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
+    }
+}
+
 // A clipping container overlaid on a rectangle of cells of the visible screen grid. It holds a WKWebView laid out at
 // the block's full height and offset by the rows cropped off the top, so a partly scrolled-out block is cropped like
 // text instead of re-laid out. State lives on the view itself so PTYTextView needs no extra storage.
 @objc(iTermInlineWebView)
-class InlineWebView: NSView, WKNavigationDelegate, iTermMetalDisabling {
+class InlineWebView: NSView, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, iTermMetalDisabling {
     func viewDisablesMetal() -> Bool { true }
 
     static let allowedHostsKey = "InlineWebViewAllowedHosts"
+    static let consoleHandlerName = "iTermInlineWebConsole"
     var webViewID = ""
     var row = 0, col = 0, cols = 0, rows = 0, cropTop = 0, fullRows = 0
     let web: InlineWKWebView
+    // Non-nil for views created over the control socket: they use the desktop URL policy with these file roots.
+    let fileRoots: [String]?
+    var loadError: String?
+    // Kept so removal can still route the closed event after the view leaves its superview.
+    fileprivate weak var owner: PTYTextView?
+    private var waiters = [() -> Void]()
+    private var observations = [NSKeyValueObservation]()
+    private var eventScheduled = false
+    private var pendingDialog: ((Bool, String?) -> Void)?
+    private var dialogSerial = 0
 
-    init(url: URL) {
+    init(url: URL?, fileRoots: [String]? = nil) {
+        self.fileRoots = fileRoots
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
+        config.userContentController.addUserScript(WKUserScript(source: Self.consoleScript,
+                                                                injectionTime: .atDocumentStart,
+                                                                forMainFrameOnly: true))
         web = InlineWKWebView(frame: .zero, configuration: config)
         super.init(frame: .zero)
+        config.userContentController.add(WeakScriptMessageHandler(self), name: Self.consoleHandlerName)
         wantsLayer = true
         layer?.masksToBounds = true
         web.navigationDelegate = self
+        web.uiDelegate = self
         addSubview(web)
-        web.load(URLRequest(url: url))
+        let changed: (WKWebView) -> Void = { [weak self] _ in self?.stateDidChange() }
+        observations = [web.observe(\.url) { w, _ in changed(w) },
+                        web.observe(\.title) { w, _ in changed(w) },
+                        web.observe(\.isLoading) { w, _ in changed(w) },
+                        web.observe(\.canGoBack) { w, _ in changed(w) },
+                        web.observe(\.canGoForward) { w, _ in changed(w) }]
+        if let url {
+            web.load(URLRequest(url: url))
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -1347,8 +1389,22 @@ class InlineWebView: NSView, WKNavigationDelegate, iTermMetalDisabling {
     }
 
     override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(web)
+        if !web.isHidden {
+            window?.makeFirstResponder(web)
+        }
     }
+
+    // Shown over the cells instead of a page whose URL the allowlist refused.
+    func showBlocked(_ host: String) {
+        web.isHidden = true
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        let label = NSTextField(labelWithString: "Blocked by inline web allowlist: \(host)")
+        label.frame = bounds
+        label.autoresizingMask = [.width, .height]
+        addSubview(label)
+    }
+
+    // MARK: URL policies
 
     static func isAllowed(_ url: URL?) -> Bool {
         guard let url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
@@ -1359,10 +1415,407 @@ class InlineWebView: NSView, WKNavigationDelegate, iTermMetalDisabling {
         return hosts.map { $0.lowercased() }.contains(host)
     }
 
-    // Top-level navigations (including redirects and link clicks) must stay on the allowlist.
+    static func decodeBase64URL(_ b64: String) -> URL? {
+        guard let data = Data(base64Encoded: b64.padding(toLength: (b64.count + 3) / 4 * 4, withPad: "=", startingAt: 0)) else {
+            return nil
+        }
+        return URL(string: String(decoding: data, as: UTF8.self))
+    }
+
+    // The address a controller asked for, with a scheme added like the desktop app's address bar does.
+    static func desktopURL(_ input: String) -> URL? {
+        let value = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value.lowercased() == "about:blank" {
+            return URL(string: "about:blank")
+        }
+        if value.range(of: "^[a-zA-Z][a-zA-Z0-9+.-]*://", options: .regularExpression) != nil {
+            return URL(string: value)
+        }
+        let local = value.range(of: #"^(?:(?:[a-z\d-]+\.)*localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)"#,
+                                options: [.regularExpression, .caseInsensitive]) != nil
+        return URL(string: (local ? "http://" : "https://") + value)
+    }
+
+    // Desktop policy: any http(s) page without credentials, about:blank, and local files inside a root.
+    static func desktopRefusal(_ url: URL, fileRoots: [String]) -> String? {
+        let scheme = url.scheme?.lowercased() ?? ""
+        if url.absoluteString.lowercased() == "about:blank" || fileRoot(of: url, in: fileRoots) != nil {
+            return nil
+        }
+        if ["http", "https"].contains(scheme) && !(url.host ?? "").isEmpty {
+            return url.user == nil && url.password == nil ? nil : "URLs with a user name or password are not supported. Remove them from the URL."
+        }
+        return fileRoots.isEmpty
+            ? "Only HTTP, HTTPS, and about:blank URLs are supported."
+            : "Only HTTP, HTTPS, about:blank, and file URLs inside the workspace are supported."
+    }
+
+    static func fileRoot(of url: URL, in roots: [String]) -> String? {
+        guard url.isFileURL, (url.host ?? "").isEmpty else {
+            return nil
+        }
+        let path = url.standardized.path
+        return roots.first { root in
+            var prefix = root
+            while prefix.hasSuffix("/") {
+                prefix.removeLast()
+            }
+            return path == prefix || path.hasPrefix(prefix + "/")
+        }
+    }
+
+    func refusal(_ url: URL) -> String? {
+        guard let fileRoots else {
+            return Self.isAllowed(url) ? nil : "Blocked by inline web allowlist: \(url.host ?? url.absoluteString)"
+        }
+        return Self.desktopRefusal(url, fileRoots: fileRoots)
+    }
+
+    func open(_ url: URL) throws {
+        if let reason = refusal(url) {
+            throw InlineWebError(reason)
+        }
+        loadError = nil
+        if let fileRoots, let root = Self.fileRoot(of: url, in: fileRoots) {
+            web.loadFileURL(url, allowingReadAccessTo: URL(fileURLWithPath: root))
+        } else {
+            web.load(URLRequest(url: url))
+        }
+    }
+
+    // Top-level navigations (including redirects and link clicks) must stay within the view's policy.
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         let isSubframe = navigationAction.targetFrame.map { !$0.isMainFrame } ?? false
-        decisionHandler(isSubframe || Self.isAllowed(navigationAction.request.url) ? .allow : .cancel)
+        let allowed = navigationAction.request.url.map { refusal($0) == nil } ?? false
+        decisionHandler(isSubframe || allowed ? .allow : .cancel)
+    }
+
+    // target=_blank links open in place.
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            try? open(url)
+        }
+        return nil
+    }
+
+    // MARK: Navigation state
+
+    var info: [String: Any] {
+        var info: [String: Any] = ["view": webViewID,
+                                   "url": web.url?.absoluteString ?? "",
+                                   "title": web.title ?? "",
+                                   "loading": web.isLoading,
+                                   "canGoBack": web.canGoBack,
+                                   "canGoForward": web.canGoForward]
+        if let loadError {
+            info["loadError"] = loadError
+        }
+        return info
+    }
+
+    func emit(_ event: [String: Any]) {
+        if let owner {
+            InlineWebControl.shared.send(event, to: owner)
+        }
+    }
+
+    private func stateDidChange() {
+        if !web.isLoading {
+            flushWaiters()
+        }
+        guard !eventScheduled else {
+            return
+        }
+        eventScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            eventScheduled = false
+            emit(info.merging(["event": "navigation"]) { a, _ in a })
+        }
+    }
+
+    // Runs `done` once the current navigation settles. Same-document navigations never start loading, so they
+    // settle on the first check; a stuck load gives up after 30s.
+    func afterNavigation(_ done: @escaping () -> Void) {
+        waiters.append(done)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            if self?.web.isLoading == false {
+                self?.flushWaiters()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            self?.flushWaiters()
+        }
+    }
+
+    private func flushWaiters() {
+        let waiters = self.waiters
+        self.waiters = []
+        waiters.forEach { $0() }
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        loadError = nil
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        loadFailed(error)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        loadFailed(error)
+    }
+
+    private func loadFailed(_ error: Error) {
+        if (error as NSError).code != NSURLErrorCancelled {
+            loadError = error.localizedDescription
+        }
+        flushWaiters()
+        stateDidChange()
+    }
+
+    // Called just before the view leaves its text view, for any reason.
+    fileprivate func willClose() {
+        _ = answerDialog(accept: false, text: nil)
+        flushWaiters()
+        emit(["event": "closed", "view": webViewID])
+    }
+
+    // MARK: Console
+
+    private static let consoleScript = """
+    (() => {
+      const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.\(consoleHandlerName);
+      if (!handler) return;
+      const str = (a) => { try { return typeof a === "string" ? a : a instanceof Error ? (a.stack || String(a)) : (JSON.stringify(a) ?? String(a)); } catch { return String(a); } };
+      const post = (level, args, extra) => { try { handler.postMessage(Object.assign({ level, text: args.map(str).join(" ").slice(0, 10000) }, extra || {})); } catch {} };
+      for (const level of ["log", "info", "warn", "error", "debug"]) {
+        const original = console[level];
+        console[level] = function (...args) { post(level, args); return original.apply(this, args); };
+      }
+      addEventListener("error", (e) => post("error", [e.message], { url: e.filename, line: e.lineno, column: e.colno }));
+      addEventListener("unhandledrejection", (e) => post("error", ["Unhandled rejection:", e.reason]));
+    })();
+    """
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let owner, InlineWebControl.shared.isControlled(owner),
+              let body = message.body as? [String: Any],
+              let level = body["level"] as? String, let text = body["text"] as? String else {
+            return
+        }
+        var event: [String: Any] = ["event": "console", "view": webViewID, "level": String(level.prefix(16)), "text": String(text.prefix(10_000))]
+        if let url = body["url"] as? String {
+            event["url"] = String(url.prefix(2048))
+        }
+        if let line = body["line"] as? Int {
+            event["line"] = line
+        }
+        if let column = body["column"] as? Int {
+            event["column"] = column
+        }
+        emit(event)
+    }
+
+    // MARK: Dialogs
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        ask(["type": "alert", "message": message]) { _, _ in completionHandler() }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        ask(["type": "confirm", "message": message]) { accept, _ in completionHandler(accept) }
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+        ask(["type": "prompt", "message": prompt, "defaultText": defaultText ?? ""]) { accept, text in
+            completionHandler(accept ? (text ?? defaultText ?? "") : nil)
+        }
+    }
+
+    // Held for the controller to answer; without one nobody can, so it is dismissed right away.
+    private func ask(_ dialog: [String: Any], _ answer: @escaping (Bool, String?) -> Void) {
+        guard pendingDialog == nil, let owner, InlineWebControl.shared.isControlled(owner) else {
+            answer(false, nil)
+            return
+        }
+        pendingDialog = answer
+        dialogSerial += 1
+        let serial = dialogSerial
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            if self?.dialogSerial == serial {
+                _ = self?.answerDialog(accept: false, text: nil)
+            }
+        }
+        emit(dialog.merging(["event": "dialog", "view": webViewID]) { a, _ in a })
+    }
+
+    func answerDialog(accept: Bool, text: String?) -> Bool {
+        guard let pendingDialog else {
+            return false
+        }
+        self.pendingDialog = nil
+        dialogSerial += 1
+        pendingDialog(accept, text)
+        return true
+    }
+
+    // MARK: Snapshot and trusted input
+
+    func screenshot(rect: NSRect?, _ done: @escaping (Result<Any, Error>) -> Void) {
+        let config = WKSnapshotConfiguration()
+        if let rect {
+            config.rect = rect
+        }
+        web.takeSnapshot(with: config) { image, error in
+            guard let cg = image?.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else {
+                done(.failure(error ?? InlineWebError("Snapshot failed.")))
+                return
+            }
+            done(.success(["png": png.base64EncodedString(), "width": cg.width, "height": cg.height]))
+        }
+    }
+
+    // CSS px relative to the page viewport, in window coordinates.
+    private func windowPoint(_ x: Double, _ y: Double) -> NSPoint {
+        return web.convert(NSPoint(x: x, y: web.isFlipped ? y : web.bounds.height - y), to: nil)
+    }
+
+    // Synthetic events must never move keyboard focus away from the terminal.
+    private func inWindow(_ body: (NSWindow) throws -> Void) throws {
+        guard let window = web.window else {
+            throw InlineWebError("The web view is not in a window.")
+        }
+        let before = window.firstResponder
+        defer {
+            if window.firstResponder !== before {
+                window.makeFirstResponder(before)
+            }
+        }
+        try body(window)
+    }
+
+    func mouse(_ type: String, x: Double, y: Double, button: String, clickCount: Int) throws {
+        try inWindow { window in
+            let (down, up): (NSEvent.EventType, NSEvent.EventType) = switch button {
+            case "right": (.rightMouseDown, .rightMouseUp)
+            case "middle": (.otherMouseDown, .otherMouseUp)
+            default: (.leftMouseDown, .leftMouseUp)
+            }
+            let location = windowPoint(x, y)
+            func send(_ type: NSEvent.EventType) {
+                guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [],
+                                                     timestamp: ProcessInfo.processInfo.systemUptime,
+                                                     windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                                     clickCount: type == .mouseMoved ? 0 : clickCount,
+                                                     pressure: type == down ? 1 : 0) else {
+                    return
+                }
+                switch type {
+                case .mouseMoved: web.mouseMoved(with: event)
+                case .leftMouseDown: web.mouseDown(with: event)
+                case .leftMouseUp: web.mouseUp(with: event)
+                case .rightMouseDown: web.rightMouseDown(with: event)
+                case .rightMouseUp: web.rightMouseUp(with: event)
+                case .otherMouseDown: web.otherMouseDown(with: event)
+                case .otherMouseUp: web.otherMouseUp(with: event)
+                default: break
+                }
+            }
+            switch type {
+            case "move": send(.mouseMoved)
+            case "down": send(down)
+            case "up": send(up)
+            case "click":
+                send(.mouseMoved)
+                send(down)
+                send(up)
+            default: throw InlineWebError("Unknown mouse type \(type).")
+            }
+        }
+    }
+
+    func scroll(x: Double, y: Double, dx: Double, dy: Double) throws {
+        try inWindow { window in
+            let clamp = { (v: Double) in Int32(max(-1_000_000, min(1_000_000, -v))) }
+            let point = window.convertPoint(toScreen: windowPoint(x, y))
+            guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+                                   wheel1: clamp(dy), wheel2: clamp(dx), wheel3: 0) else {
+                throw InlineWebError("Could not create a scroll event.")
+            }
+            // CGEvent locations are global, with the origin at the top left of the main display.
+            cg.location = CGPoint(x: point.x, y: (NSScreen.screens.first?.frame.height ?? 0) - point.y)
+            guard let event = NSEvent(cgEvent: cg) else {
+                throw InlineWebError("Could not create a scroll event.")
+            }
+            web.scrollWheel(with: event)
+        }
+    }
+
+    private static func functionKey(_ key: Int) -> String {
+        return String(Character(UnicodeScalar(UInt32(key))!))
+    }
+
+    private static let namedKeys: [String: (code: UInt16, chars: String, function: Bool)] = [
+        "Enter": (36, "\r", false), "Tab": (48, "\t", false), "Escape": (53, "\u{1b}", false),
+        "Backspace": (51, "\u{7f}", false), "Space": (49, " ", false),
+        "Delete": (117, functionKey(NSDeleteFunctionKey), true),
+        "ArrowUp": (126, functionKey(NSUpArrowFunctionKey), true),
+        "ArrowDown": (125, functionKey(NSDownArrowFunctionKey), true),
+        "ArrowLeft": (123, functionKey(NSLeftArrowFunctionKey), true),
+        "ArrowRight": (124, functionKey(NSRightArrowFunctionKey), true),
+        "Home": (115, functionKey(NSHomeFunctionKey), true), "End": (119, functionKey(NSEndFunctionKey), true),
+        "PageUp": (116, functionKey(NSPageUpFunctionKey), true), "PageDown": (121, functionKey(NSPageDownFunctionKey), true),
+    ]
+
+    func key(text: String?, key: String?, modifiers: [String]) throws {
+        var flags: NSEvent.ModifierFlags = []
+        for modifier in modifiers {
+            switch modifier {
+            case "shift": flags.insert(.shift)
+            case "meta": flags.insert(.command)
+            case "alt": flags.insert(.option)
+            case "ctrl": flags.insert(.control)
+            default: throw InlineWebError("Unknown modifier \(modifier).")
+            }
+        }
+        var strokes = [(code: UInt16, chars: String, flags: NSEvent.ModifierFlags)]()
+        if let key {
+            if let named = Self.namedKeys[key] {
+                strokes.append((named.code, named.chars, named.function ? flags.union([.function, .numericPad]) : flags))
+            } else if key.count == 1 {
+                strokes.append((0, key, flags))
+            } else {
+                throw InlineWebError("Unknown key \(key).")
+            }
+        }
+        for character in (text ?? "").prefix(10_000) {
+            strokes.append((0, String(character), flags))
+        }
+        guard !strokes.isEmpty else {
+            throw InlineWebError("key needs text or key.")
+        }
+        try inWindow { window in
+            for stroke in strokes {
+                func make(_ type: NSEvent.EventType) -> NSEvent? {
+                    return NSEvent.keyEvent(with: type, location: .zero, modifierFlags: stroke.flags,
+                                            timestamp: ProcessInfo.processInfo.systemUptime,
+                                            windowNumber: window.windowNumber, context: nil,
+                                            characters: stroke.chars, charactersIgnoringModifiers: stroke.chars,
+                                            isARepeat: false, keyCode: stroke.code)
+                }
+                guard let down = make(.keyDown), let up = make(.keyUp) else {
+                    continue
+                }
+                if !(stroke.flags.contains(.command) && web.performKeyEquivalent(with: down)) {
+                    web.synthesizedKeyDown(down)
+                }
+                web.keyUp(with: up)
+            }
+        }
     }
 }
 
@@ -1377,6 +1830,11 @@ class InlineWKWebView: WKWebView {
             deactivate()
             return
         }
+        super.keyDown(with: event)
+    }
+
+    // A controller's Escape goes to the page.
+    func synthesizedKeyDown(_ event: NSEvent) {
         super.keyDown(with: event)
     }
 
@@ -1407,29 +1865,44 @@ extension PTYTextView {
             return
         }
         switch command {
-        case "WebView":
-            guard let b64 = args["url"],
-                  let data = Data(base64Encoded: b64.padding(toLength: (b64.count + 3) / 4 * 4, withPad: "=", startingAt: 0)),
-                  let url = URL(string: String(decoding: data, as: UTF8.self)),
-                  InlineWebView.isAllowed(url) else {
-                DLog("Dropping inline web view \(id)")
+        case "WebView", "WebViewMove":
+            if let view = inlineWebViews.first(where: { $0.webViewID == id }),
+               command == "WebViewMove" || view.fileRoots != nil {
+                // Moves, and placements of views a controller created over the control socket, keep the page.
+                place(view, args)
+            } else if command == "WebView" || args["url"] != nil {
+                // A move with a url recreates a view this process doesn't know, e.g. after an iTerm2 restart.
+                let url = args["url"].flatMap(InlineWebView.decodeBase64URL)
+                let allowed = InlineWebView.isAllowed(url)
+                removeInlineWebViews(id: id)
+                let view = InlineWebView(url: allowed ? url : nil)
+                if !allowed {
+                    DLog("Blocking inline web view \(id)")
+                    view.showBlocked(url?.host ?? "invalid URL")
+                }
+                place(view, args)
+                addInlineWebView(view, id: id)
+                return
+            } else {
                 return
             }
-            removeInlineWebViews(id: id)
-            let view = InlineWebView(url: url)
-            view.webViewID = id
-            place(view, args)
-            addSubview(view)
-        case "WebViewMove":
-            guard let view = inlineWebViews.first(where: { $0.webViewID == id }) else {
-                return
-            }
-            place(view, args)
         case "WebViewRemove":
             removeInlineWebViews(id: id)
+            return
         default:
             return
         }
+        updateInlineWebViewFrames()
+    }
+
+    fileprivate func addInlineWebView(_ view: InlineWebView, id: String) {
+        view.webViewID = id
+        view.owner = self
+        addSubview(view)
+        inlineWebViewsDidChange()
+    }
+
+    private func inlineWebViewsDidChange() {
         updateInlineWebViewFrames()
         NotificationCenter.default.post(name: NSNotification.Name.iTermPortholesDidChange, object: nil)
         updateAlphaValue()
@@ -1450,7 +1923,7 @@ extension PTYTextView {
         removeInlineWebViews(id: "*")
     }
 
-    private func removeInlineWebViews(id: String) {
+    fileprivate func removeInlineWebViews(id: String) {
         let doomed = inlineWebViews.filter { id == "*" || $0.webViewID == id }
         guard !doomed.isEmpty else {
             return
@@ -1458,10 +1931,11 @@ extension PTYTextView {
         if let responder = window?.firstResponder as? NSView, doomed.contains(where: { responder.isDescendant(of: $0) }) {
             window?.makeFirstResponder(self)
         }
-        doomed.forEach { $0.removeFromSuperview() }
-        NotificationCenter.default.post(name: NSNotification.Name.iTermPortholesDidChange, object: nil)
-        updateAlphaValue()
-        delegate?.textViewDidAddOrRemovePorthole()
+        doomed.forEach {
+            $0.willClose()
+            $0.removeFromSuperview()
+        }
+        inlineWebViewsDidChange()
     }
 
     // Cells are relative to the visible screen grid, which starts below the scrollback.
@@ -1476,6 +1950,10 @@ extension PTYTextView {
             view.isHidden = view.cols <= 0 || view.rows <= 0 || view.row < 0 || view.col < 0 || view.row >= height || view.col >= width
             // Skipping hidden views keeps the subtractions below in range for any parsed Int.
             if view.isHidden {
+                // A controller's view that was never placed still needs a viewport to lay out and snapshot.
+                if view.web.frame.isEmpty {
+                    view.web.frame = NSRect(x: 0, y: 0, width: 1280, height: 800)
+                }
                 continue
             }
             view.frame = NSRect(x: left + CGFloat(view.col) * charWidth,
@@ -1486,6 +1964,335 @@ extension PTYTextView {
                                     y: -CGFloat(view.cropTop) * lineHeight,
                                     width: view.frame.width,
                                     height: CGFloat(max(view.fullRows, view.cropTop + view.rows)) * lineHeight)
+        }
+    }
+}
+
+// MARK: - Inline web control socket
+
+// A per-process Unix socket through which a program in a session (e.g. an OpenCode TUI plugin) drives that session's
+// inline web views. Socket IO runs on background threads; everything else on the main thread. See PROTOCOL.md.
+@objc(iTermInlineWebControl)
+class InlineWebControl: NSObject {
+    static let shared = InlineWebControl()
+    private var path: String?
+    private let tokens = NSMapTable<PTYSession, NSString>.weakToStrongObjects()
+    private var connections = [Connection]()
+
+    final class Connection {
+        let fd: Int32
+        weak var session: PTYSession?
+        var bound = false
+        private let writeQueue = DispatchQueue(label: "com.iterm2.inline-web-control.write")
+
+        init(fd: Int32) {
+            self.fd = fd
+        }
+
+        func readLoop() {
+            var buffer = [UInt8]()
+            var chunk = [UInt8](repeating: 0, count: 65536)
+            while buffer.count < 16 << 20 {
+                let n = read(fd, &chunk, chunk.count)
+                if n < 0 && errno == EINTR {
+                    continue
+                }
+                if n <= 0 {
+                    break
+                }
+                buffer.append(contentsOf: chunk[0..<n])
+                while let newline = buffer.firstIndex(of: 10) {
+                    let line = Data(buffer[..<newline])
+                    buffer.removeFirst(newline + 1)
+                    DispatchQueue.main.async {
+                        InlineWebControl.shared.handle(line, from: self)
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                InlineWebControl.shared.connections.removeAll { $0 === self }
+            }
+            writeQueue.async { [fd] in
+                Darwin.close(fd)
+            }
+        }
+
+        func send(_ object: [String: Any]) {
+            guard var data = try? JSONSerialization.data(withJSONObject: object) else {
+                return
+            }
+            data.append(10)
+            writeQueue.async { [fd] in
+                data.withUnsafeBytes { buf in
+                    var offset = 0
+                    while offset < buf.count {
+                        let n = write(fd, buf.baseAddress! + offset, buf.count - offset)
+                        if n < 0 && errno == EINTR {
+                            continue
+                        }
+                        if n <= 0 {
+                            return
+                        }
+                        offset += n
+                    }
+                }
+            }
+        }
+
+        func close() {
+            writeQueue.async { [fd] in
+                shutdown(fd, SHUT_RDWR)
+            }
+        }
+    }
+
+    @objc(environmentForSession:)
+    static func environment(for session: PTYSession) -> [String: String] {
+        return shared.environment(for: session)
+    }
+
+    private func environment(for session: PTYSession) -> [String: String] {
+        guard let path = start() else {
+            return [:]
+        }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard let token = tokens.object(forKey: session) as String? ??
+                (SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess
+                    ? bytes.map { String(format: "%02x", $0) }.joined()
+                    : nil) else {
+            return [:]
+        }
+        tokens.setObject(token as NSString, forKey: session)
+        return ["ITERM_INLINEWEB_SOCKET": path, "ITERM_INLINEWEB_TOKEN": token]
+    }
+
+    private func start() -> String? {
+        if let path {
+            return path
+        }
+        let dir = NSHomeDirectory() + "/Library/Application Support/iTerm2"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        chmod(dir, 0o700)
+        let path = dir + "/inlineweb-\(getpid()).sock"
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else {
+            DLog("Inline web control socket path too long: \(path)")
+            return nil
+        }
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: bytes) }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            return nil
+        }
+        unlink(path)
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        } == 0
+        guard bound, chmod(path, 0o600) == 0, listen(fd, 16) == 0 else {
+            DLog("Inline web control socket failed: \(errno)")
+            Darwin.close(fd)
+            unlink(path)
+            return nil
+        }
+        self.path = path
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+            unlink(path)
+        }
+        Thread.detachNewThread {
+            while true {
+                let client = accept(fd, nil, nil)
+                if client < 0 {
+                    if errno == EINTR || errno == ECONNABORTED {
+                        continue
+                    }
+                    return
+                }
+                var uid = uid_t(0), gid = gid_t(0)
+                guard getpeereid(client, &uid, &gid) == 0, uid == getuid() else {
+                    Darwin.close(client)
+                    continue
+                }
+                var on: Int32 = 1
+                setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+                let connection = Connection(fd: client)
+                Thread.detachNewThread {
+                    connection.readLoop()
+                }
+            }
+        }
+        return path
+    }
+
+    func isControlled(_ textView: PTYTextView) -> Bool {
+        return connections.contains { $0.session?.textview === textView }
+    }
+
+    func send(_ event: [String: Any], to textView: PTYTextView) {
+        for connection in connections where connection.session?.textview === textView {
+            connection.send(event)
+        }
+    }
+
+    private func handle(_ line: Data, from connection: Connection) {
+        guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+            connection.send(["ok": false, "error": "Invalid JSON."])
+            return
+        }
+        if !connection.bound {
+            guard let hello = message["hello"] as? [String: Any],
+                  let token = hello["token"] as? String,
+                  let session = tokens.keyEnumerator().allObjects.compactMap({ $0 as? PTYSession }).first(where: {
+                      (tokens.object(forKey: $0) as String?) == token
+                  }) else {
+                connection.send(["ok": false, "error": "Bad token."])
+                connection.close()
+                return
+            }
+            connection.bound = true
+            connection.session = session
+            connections.append(connection)
+            connection.send(["ok": true, "hello": ["version": 1]])
+            return
+        }
+        let id = message["id"] ?? NSNull()
+        let reply: (Result<Any, Error>) -> Void = { result in
+            var response: [String: Any]
+            switch result {
+            case .success(let value):
+                response = ["id": id, "ok": true, "value": value]
+            case .failure(let error):
+                let message = (error as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String ?? error.localizedDescription
+                response = ["id": id, "ok": false, "error": message]
+            }
+            if !JSONSerialization.isValidJSONObject(response) {
+                response = ["id": id, "ok": false, "error": "The result is not JSON-serializable."]
+            }
+            connection.send(response)
+        }
+        do {
+            guard let op = message["op"] as? String else {
+                throw InlineWebError("Missing op.")
+            }
+            guard let textView = connection.session?.textview else {
+                throw InlineWebError("The session is gone.")
+            }
+            try perform(op, message["args"] as? [String: Any] ?? [:], textView, reply)
+        } catch {
+            reply(.failure(error))
+        }
+    }
+
+    private func perform(_ op: String, _ args: [String: Any], _ textView: PTYTextView, _ reply: @escaping (Result<Any, Error>) -> Void) throws {
+        if op == "list" {
+            reply(.success(textView.inlineWebViews.map { $0.info }))
+            return
+        }
+        guard let id = args["view"] as? String, !id.isEmpty else {
+            throw InlineWebError("Missing view.")
+        }
+        let existing = textView.inlineWebViews.first { $0.webViewID == id }
+        func url() throws -> URL {
+            guard let url = InlineWebView.desktopURL(args["url"] as? String ?? "") else {
+                throw InlineWebError("Invalid URL.")
+            }
+            return url
+        }
+        func number(_ key: String) throws -> Double {
+            guard let value = args[key] as? Double else {
+                throw InlineWebError("Missing number \(key).")
+            }
+            return value
+        }
+        if op == "create" {
+            let url = try url()
+            let view = existing ?? InlineWebView(url: nil, fileRoots: args["fileRoots"] as? [String] ?? [])
+            try view.open(url)
+            if existing == nil {
+                textView.addInlineWebView(view, id: id)
+            }
+            view.afterNavigation { reply(.success(view.info)) }
+            return
+        }
+        guard let view = existing else {
+            throw InlineWebError("No web view \(id) in this session.")
+        }
+        let afterNavigation = { view.afterNavigation { reply(.success(view.info)) } }
+        switch op {
+        case "navigate":
+            try view.open(try url())
+            afterNavigation()
+        case "back":
+            guard view.web.goBack() != nil else {
+                throw InlineWebError("Cannot go back.")
+            }
+            afterNavigation()
+        case "forward":
+            guard view.web.goForward() != nil else {
+                throw InlineWebError("Cannot go forward.")
+            }
+            afterNavigation()
+        case "reload":
+            view.web.reload()
+            afterNavigation()
+        case "stop":
+            view.web.stopLoading()
+            reply(.success(view.info))
+        case "eval":
+            guard let script = args["script"] as? String else {
+                throw InlineWebError("Missing script.")
+            }
+            view.web.callAsyncJavaScript(script, arguments: args["args"] as? [String: Any] ?? [:], in: nil, in: .page) { result in
+                reply(result.flatMap { value in
+                    let value = Self.jsonValue(value)
+                    guard let data = try? JSONSerialization.data(withJSONObject: [value]) else {
+                        return .failure(InlineWebError("The result is not JSON-serializable."))
+                    }
+                    guard data.count <= 512 * 1024 else {
+                        return .failure(InlineWebError("The result is \(data.count) bytes; the limit is 524288."))
+                    }
+                    return .success(value)
+                })
+            }
+        case "screenshot":
+            var rect: NSRect?
+            if let r = args["rect"] as? [String: Any] {
+                rect = NSRect(x: r["x"] as? Double ?? 0, y: r["y"] as? Double ?? 0, width: r["w"] as? Double ?? 0, height: r["h"] as? Double ?? 0)
+            }
+            view.screenshot(rect: rect, reply)
+        case "mouse":
+            try view.mouse(args["type"] as? String ?? "", x: try number("x"), y: try number("y"),
+                           button: args["button"] as? String ?? "left", clickCount: args["clickCount"] as? Int ?? 1)
+            reply(.success(NSNull()))
+        case "scroll":
+            try view.scroll(x: try number("x"), y: try number("y"), dx: args["dx"] as? Double ?? 0, dy: args["dy"] as? Double ?? 0)
+            reply(.success(NSNull()))
+        case "key":
+            try view.key(text: args["text"] as? String, key: args["key"] as? String, modifiers: args["modifiers"] as? [String] ?? [])
+            reply(.success(NSNull()))
+        case "dialog":
+            guard view.answerDialog(accept: args["accept"] as? Bool ?? false, text: args["text"] as? String) else {
+                throw InlineWebError("No dialog is open.")
+            }
+            reply(.success(NSNull()))
+        case "remove":
+            textView.removeInlineWebViews(id: id)
+            reply(.success(NSNull()))
+        default:
+            throw InlineWebError("Unknown op \(op).")
+        }
+    }
+
+    // WebKit returns dates as NSDate, which JSON can't hold.
+    private static func jsonValue(_ value: Any) -> Any {
+        switch value {
+        case let date as Date: return ISO8601DateFormatter().string(from: date)
+        case let array as [Any]: return array.map(jsonValue)
+        case let dict as [String: Any]: return dict.mapValues(jsonValue)
+        default: return value
         }
     }
 }

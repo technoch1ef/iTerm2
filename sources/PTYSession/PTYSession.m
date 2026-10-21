@@ -3430,6 +3430,7 @@ ITERM_WEAKLY_REFERENCEABLE
         env[@"TERM_FEATURES"] = [VT100Output encodedTermFeaturesForCapabilities:[self capabilities]];
     }
     env[@"ITERM_SESSION_ID"] = itermId;
+    [env addEntriesFromDictionary:[iTermInlineWebControl environmentForSession:self]];
     env[@"TERM_PROGRAM_VERSION"] = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleShortVersionString"];
     env[@"TERM_SESSION_ID"] = itermId;
     env[@"TERM_PROGRAM"] = @"iTerm.app";
