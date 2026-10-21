@@ -2070,7 +2070,8 @@ class InlineWebControl: NSObject {
         if let path {
             return path
         }
-        let dir = NSHomeDirectory() + "/Library/Application Support/iTerm2"
+        // Own subdirectory, so tightening it never changes the folder stock iTerm2 shares.
+        let dir = NSHomeDirectory() + "/Library/Application Support/iTerm2/inlineweb"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         chmod(dir, 0o700)
         let path = dir + "/inlineweb-\(getpid()).sock"
